@@ -1,0 +1,627 @@
+name: Build Kumyk AI Dataset
+
+on:
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests "huggingface_hub>=0.25" "datasets>=3.0" pandas pyarrow gcsfs
+
+      - name: Write collector
+        shell: bash
+        run: |
+          cat > collect_kumyk_dataset.py <<'PY'
+
+          from __future__ import annotations
+
+          from pathlib import Path
+          import collections
+          import csv
+          import gzip
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import sys
+          import traceback
+          import unicodedata
+          from typing import Iterable
+
+          import requests
+
+          ROOT = Path("kumyk_dataset")
+          RAW = ROOT / "raw"
+          PROC = ROOT / "processed"
+          FINAL = ROOT / "final"
+          REPORTS = ROOT / "reports"
+          for p in (RAW, PROC, FINAL, REPORTS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          MANIFEST = []
+          ERRORS = []
+
+          def log(*args):
+              print(*args, flush=True)
+
+          def add_manifest(source_id, kind, license_name, rows=None, note=""):
+              MANIFEST.append({
+                  "source_id": source_id,
+                  "kind": kind,
+                  "license": license_name,
+                  "rows": rows,
+                  "note": note,
+              })
+
+          def fail(source_id, exc):
+              msg = f"{type(exc).__name__}: {exc}"
+              ERRORS.append({"source_id": source_id, "error": msg})
+              log("WARNING", source_id, msg)
+              traceback.print_exc()
+
+          def download(url: str, path: Path):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              log("GET", url)
+              with requests.get(url, stream=True, timeout=180, headers={"User-Agent": "KumykAIResearch/1.0"}) as r:
+                  r.raise_for_status()
+                  with path.open("wb") as f:
+                      for chunk in r.iter_content(1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
+              return path
+
+          def norm(s: str) -> str:
+              s = unicodedata.normalize("NFC", s or "").replace("\u00a0", " ")
+              s = re.sub(r"\s+", " ", s).strip()
+              s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+              return s
+
+          def cyr_ratio(s: str) -> float:
+              letters = [c for c in s if c.isalpha()]
+              if not letters:
+                  return 0.0
+              cyr = sum("CYRILLIC" in unicodedata.name(c, "") for c in letters)
+              return cyr / len(letters)
+
+          KUM_HINTS = (
+              "булан", "учун", "герек", "дагъы", "къумукъ", "магъа", "сагъа",
+              "мен", "сен", "олар", "биз", "гел", "бар", "бол", "эт", "тюгюл",
+              "ёкъ", "яшав", "халкъ", "гюн", "гече", "ахшам"
+          )
+          SPECIAL = ("гъ", "гь", "къ", "оь", "уь")
+          BAD_WEB = ("javascript", "cookie policy", "privacy policy", "lorem ipsum", "http://", "https://")
+
+          def kumyk_evidence(s: str) -> float:
+              t = norm(s).casefold()
+              score = 0.0
+              score += min(5.0, sum(t.count(x) for x in SPECIAL) * 0.5)
+              score += min(5.0, sum(1 for x in KUM_HINTS if re.search(rf"(?<!\w){re.escape(x)}(?!\w)", t)) * 0.55)
+              score -= sum(3.0 for x in BAD_WEB if x in t)
+              return score
+
+          def valid_pair(ru: str, kum: str) -> bool:
+              ru, kum = norm(ru), norm(kum)
+              if not ru or not kum:
+                  return False
+              if min(len(ru), len(kum)) < 2 or max(len(ru), len(kum)) > 2500:
+                  return False
+              if max(len(ru), len(kum)) / max(1, min(len(ru), len(kum))) > 6.0:
+                  return False
+              if cyr_ratio(ru) < 0.65 or cyr_ratio(kum) < 0.65:
+                  return False
+              if any(x in kum.casefold() for x in BAD_WEB):
+                  return False
+              return True
+
+          def write_jsonl(path: Path, rows: Iterable[dict]):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              n = 0
+              with path.open("w", encoding="utf-8") as f:
+                  for row in rows:
+                      f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                      n += 1
+              return n
+
+          def collect_apertium():
+              sid = "apertium_kum"
+              try:
+                  base = "https://raw.githubusercontent.com/apertium/apertium-kum/master/"
+                  files = ["apertium-kum.kum.lexc", "apertium-kum.kum.twol", "COPYING"]
+                  folder = RAW / sid
+                  for name in files:
+                      download(base + name, folder / name)
+
+                  lexc = (folder / "apertium-kum.kum.lexc").read_text(encoding="utf-8")
+                  pos_sections = {
+                      "Nouns": "noun", "Verbs": "verb", "Adjectives": "adjective",
+                      "Adverbs": "adverb", "Pronouns": "pronoun", "Determiners": "determiner",
+                      "Numerals": "numeral", "Postpositions": "postposition",
+                      "Conjunctions": "conjunction", "Interjections": "interjection",
+                  }
+
+                  rows = []
+                  seen = set()
+                  for sec, pos in pos_sections.items():
+                      start = lexc.find("LEXICON " + sec)
+                      if start < 0:
+                          continue
+                      end = lexc.find("\nLEXICON ", start + 9)
+                      block = lexc[start:end if end >= 0 else len(lexc)]
+                      for raw in block.splitlines():
+                          line = raw.strip()
+                          if not line or line.startswith("!") or ":" not in line or ";" not in line:
+                              continue
+                          lemma = line.split(":", 1)[0].strip()
+                          lemma = lemma.replace("% ", " ").replace("%-", "-").replace("%+", "")
+                          if not lemma or lemma.startswith("%<") or lemma.startswith("#"):
+                              continue
+                          m = re.search(r'!\s*"([^"]*)"', line)
+                          gloss = m.group(1).strip() if m else ""
+                          key = (lemma, pos)
+                          if key in seen:
+                              continue
+                          seen.add(key)
+                          rows.append({
+                              "kum": lemma, "pos": pos, "gloss_comment": gloss,
+                              "source_id": sid, "license": "GPL-family repository"
+                          })
+
+                  n = write_jsonl(PROC / "lexicon_apertium.jsonl", rows)
+                  add_manifest(sid, "morphology_lexicon", "GPL-family repository", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_kaikki():
+              sid = "kaikki_kum"
+              try:
+                  url = "https://kaikki.org/dictionary/Kumyk/kaikki.org-dictionary-Kumyk.jsonl"
+                  path = download(url, RAW / sid / "kumyk.jsonl")
+                  rows = []
+                  with path.open(encoding="utf-8") as f:
+                      for line in f:
+                          if not line.strip():
+                              continue
+                          obj = json.loads(line)
+                          senses = []
+                          for s in obj.get("senses", []):
+                              senses.append({
+                                  "glosses": s.get("glosses", []),
+                                  "tags": s.get("tags", []),
+                                  "topics": s.get("topics", []),
+                              })
+                          forms = []
+                          for x in obj.get("forms", []):
+                              form = x.get("form")
+                              if form and form not in forms:
+                                  forms.append(form)
+                          rows.append({
+                              "kum": obj.get("word"), "pos": obj.get("pos"),
+                              "senses": senses, "forms": forms,
+                              "source_id": sid, "license": "Wiktionary-derived"
+                          })
+                  n = write_jsonl(PROC / "lexicon_kaikki.jsonl", rows)
+                  add_manifest(sid, "dictionary", "Wiktionary-derived CC BY-SA/GFDL context", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_til():
+              sid = "til_ru_kum"
+              try:
+                  import gcsfs
+                  fs = gcsfs.GCSFileSystem(token="anon")
+                  local = RAW / sid
+                  local.mkdir(parents=True, exist_ok=True)
+
+                  downloaded = []
+                  for split in ("train", "dev", "test"):
+                      prefix = f"til-corpus/corpus/{split}/ru-kum"
+                      try:
+                          objects = fs.find(prefix)
+                      except Exception:
+                          objects = []
+                      log("TIL", split, "objects", len(objects))
+                      for obj in objects:
+                          if obj.endswith("/"):
+                              continue
+                          rel = obj[len(prefix):].lstrip("/")
+                          dest = local / split / rel
+                          dest.parent.mkdir(parents=True, exist_ok=True)
+                          with fs.open(obj, "rb") as src, dest.open("wb") as dst:
+                              shutil.copyfileobj(src, dst)
+                          downloaded.append((split, dest))
+
+                  pairs = []
+                  for split in ("train", "dev", "test"):
+                      files = [p for s, p in downloaded if s == split]
+                      rus = [p for p in files if p.name.endswith(".ru")]
+                      kum = [p for p in files if p.name.endswith(".kum")]
+
+                      # Match by stripping the final language extension.
+                      kum_map = {str(p.with_suffix("")): p for p in kum}
+                      for rp in rus:
+                          kp = kum_map.get(str(rp.with_suffix("")))
+                          if not kp:
+                              continue
+                          ru_lines = rp.read_text(encoding="utf-8", errors="replace").splitlines()
+                          ku_lines = kp.read_text(encoding="utf-8", errors="replace").splitlines()
+                          for i, (ru, ku) in enumerate(zip(ru_lines, ku_lines)):
+                              ru, ku = norm(ru), norm(ku)
+                              if valid_pair(ru, ku):
+                                  pairs.append({
+                                      "ru": ru, "kum": ku, "source_id": sid,
+                                      "source_split": split, "source_line": i + 1,
+                                      "domain": "mixed",
+                                      "license": "CC BY-NC-SA 4.0"
+                                  })
+
+                  n = write_jsonl(PROC / "parallel_til.jsonl", pairs)
+                  add_manifest(sid, "parallel", "CC BY-NC-SA 4.0", n,
+                               "Public GCS bucket; for private non-commercial research")
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_tatoeba():
+              sid = "tatoeba"
+              try:
+                  url = "https://api.tatoeba.org/v1/sentences"
+                  params = {"lang": "kum", "trans:lang": "rus", "showtrans:lang": "rus"}
+                  rows = []
+                  seen_pages = set()
+
+                  for page_num in range(1, 501):
+                      log("Tatoeba page", page_num)
+                      r = requests.get(url, params=params, timeout=90,
+                                       headers={"User-Agent": "KumykAIResearch/1.0"})
+                      r.raise_for_status()
+                      obj = r.json()
+                      page_key = r.url
+                      if page_key in seen_pages:
+                          break
+                      seen_pages.add(page_key)
+
+                      items = obj.get("data") or obj.get("results") or obj.get("sentences") or []
+                      for s in items:
+                          kum = norm(s.get("text", ""))
+                          trans = s.get("translations") or []
+                          if trans and isinstance(trans[0], list):
+                              trans = [x for grp in trans for x in grp]
+                          for tr in trans:
+                              if (tr.get("lang") or tr.get("language")) != "rus":
+                                  continue
+                              ru = norm(tr.get("text", ""))
+                              if valid_pair(ru, kum):
+                                  rows.append({
+                                      "ru": ru, "kum": kum,
+                                      "kum_id": s.get("id"), "ru_id": tr.get("id"),
+                                      "source_id": sid, "domain": "conversation",
+                                      "license": "CC BY 2.0 FR"
+                                  })
+
+                      paging = obj.get("paging") or (obj.get("meta") or {}).get("paging") or {}
+                      nxt = paging.get("next") or paging.get("next_url")
+                      if isinstance(nxt, dict):
+                          nxt = nxt.get("url")
+                      if not nxt:
+                          break
+                      url = nxt
+                      params = None
+
+                  # exact dedup
+                  uniq = {}
+                  for x in rows:
+                      uniq[(x["ru"].casefold(), x["kum"].casefold())] = x
+                  rows = list(uniq.values())
+                  n = write_jsonl(PROC / "parallel_tatoeba.jsonl", rows)
+                  add_manifest(sid, "parallel", "CC BY 2.0 FR", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_madlad():
+              sid = "madlad400_kum"
+              try:
+                  from huggingface_hub import HfFileSystem
+                  fs = HfFileSystem()
+                  pattern = "datasets/allenai/MADLAD-400/data-v1p5/kum/clean_docs_v2-*.jsonl.gz"
+                  paths = fs.glob(pattern)
+                  log("MADLAD Kumyk shards", len(paths))
+                  rows = []
+                  doc_id = 0
+                  for p in paths:
+                      log("MADLAD read", p)
+                      with fs.open(p, "rb") as raw:
+                          with gzip.GzipFile(fileobj=raw) as gz:
+                              for line in gz:
+                                  if not line.strip():
+                                      continue
+                                  obj = json.loads(line.decode("utf-8"))
+                                  text = norm(obj.get("text", ""))
+                                  if len(text) < 20:
+                                      continue
+                                  rows.append({
+                                      "id": doc_id, "text": text, "source_id": sid,
+                                      "license": "ODC-BY"
+                                  })
+                                  doc_id += 1
+                  n = write_jsonl(PROC / "mono_madlad400_clean.jsonl", rows)
+                  add_manifest(sid, "monolingual", "ODC-BY", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_bible():
+              sid = "bible_caucasus"
+              try:
+                  from datasets import load_dataset
+                  kum = load_dataset("AlidarAsvarov/bible-caucasus", "kumyk", split="train").to_pandas()
+                  rus = load_dataset("AlidarAsvarov/bible-caucasus", "russian", split="train").to_pandas()
+                  key = ["osis_id", "chapter", "start_verse"]
+                  merged = kum.merge(rus, on=key, suffixes=("_kum", "_ru"))
+                  rows = []
+                  for _, r in merged.iterrows():
+                      ru, ku = norm(str(r["text_ru"])), norm(str(r["text_kum"]))
+                      if valid_pair(ru, ku):
+                          rows.append({
+                              "ru": ru, "kum": ku, "osis_id": r["osis_id"],
+                              "chapter": int(r["chapter"]), "verse": int(r["start_verse"]),
+                              "source_id": sid, "domain": "religious",
+                              "license": "IBT copyright / non-commercial research redistribution"
+                          })
+                  n = write_jsonl(PROC / "parallel_bible.jsonl", rows)
+                  add_manifest(sid, "parallel", "IBT copyright / non-commercial research", n,
+                               "Low sampling weight because of religious register")
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_panlex():
+              sid = "panlex_meanings"
+              try:
+                  from datasets import load_dataset
+                  kum = load_dataset("cointegrated/panlex-meanings", "kum", split="train").to_pandas()
+                  rus = load_dataset("cointegrated/panlex-meanings", "rus", split="train").to_pandas()
+                  kum = kum[["txt", "meaning", "langvar_uid"]].dropna().drop_duplicates()
+                  rus = rus[["txt", "meaning", "langvar_uid"]].dropna().drop_duplicates()
+                  merged = kum.merge(rus, on="meaning", suffixes=("_kum", "_ru"))
+                  rows = []
+                  for _, r in merged.iterrows():
+                      ku, ru = norm(str(r["txt_kum"])), norm(str(r["txt_ru"]))
+                      if not ku or not ru or ku.casefold() == ru.casefold():
+                          continue
+                      rows.append({
+                          "kum": ku, "ru": ru, "meaning": int(r["meaning"]),
+                          "kum_variant": r["langvar_uid_kum"],
+                          "ru_variant": r["langvar_uid_ru"],
+                          "source_id": sid, "license": "CC0 1.0"
+                      })
+                  n = write_jsonl(PROC / "lexicon_panlex_ru_kum.jsonl", rows)
+                  add_manifest(sid, "lexicon_parallel", "CC0 1.0", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          def collect_constitution_optional():
+              sid = "dagestan_constitution"
+              token = os.environ.get("HF_TOKEN", "").strip()
+              if not token:
+                  add_manifest(sid, "parallel_optional", "CC0 1.0", 0,
+                               "Skipped: gated dataset requires accepted access + HF_TOKEN")
+                  return
+              try:
+                  from datasets import load_dataset
+                  # Dataset structure has changed historically, so try common loading forms.
+                  candidates = [
+                      ("AlidarAsvarov/dagestan-constitution", "dag_constitution"),
+                      ("AlidarAsvarov/dagestan-constitution", None),
+                  ]
+                  ds = None
+                  last = None
+                  for repo, config in candidates:
+                      try:
+                          if config:
+                              ds = load_dataset(repo, config, split="train", token=token)
+                          else:
+                              ds = load_dataset(repo, split="train", token=token)
+                          break
+                      except Exception as e:
+                          last = e
+                  if ds is None:
+                      raise last or RuntimeError("Could not load gated constitution dataset")
+
+                  rows = []
+                  for i, r in enumerate(ds):
+                      ru = norm(str(r.get("rus") or r.get("ru") or ""))
+                      ku = norm(str(r.get("kum") or ""))
+                      if valid_pair(ru, ku):
+                          rows.append({
+                              "ru": ru, "kum": ku, "source_id": sid,
+                              "domain": "legal", "source_row": i,
+                              "license": "CC0 1.0"
+                          })
+                  n = write_jsonl(PROC / "parallel_constitution.jsonl", rows)
+                  add_manifest(sid, "parallel", "CC0 1.0", n)
+              except Exception as e:
+                  fail(sid, e)
+
+          HUMAN_GOLD = [
+              {
+                  "ru": "Я пошёл играть во двор с друзьями.",
+                  "kum": "Мен къурдашларым булан абзаргъа ойнамагъа бардым.",
+                  "domain": "conversation", "source_id": "human_gold"
+              },
+              {
+                  "ru": "Убери свою постель.",
+                  "kum": "Оьзюнгню тёшегингни тайдыр.",
+                  "domain": "conversation", "source_id": "human_gold"
+              },
+              {
+                  "ru": "Закрой, пожалуйста, дверь и иди ко мне.",
+                  "kum": "Эшикни яп, ярай буса, магъа гел.",
+                  "domain": "conversation", "source_id": "human_gold"
+              },
+              {
+                  "ru": "Я приеду в Махачкалу и мы пойдём с вами вместе гулять. Вы согласны, друзья? Только гулять пойдём позже вечером.",
+                  "kum": "Мен Магьачкъалагъа гележекмен, биз сизин булан бирге къыдырмагъа баражакъбыз. Къурдашлар, разисизми? Тек къыдырмагъа ахшам гечирек баражакъбыз.",
+                  "domain": "conversation", "source_id": "human_gold"
+              },
+              {
+                  "ru": "Я вчера приехал в Махачкалу, остался на ночь, теперь поехал в Коркмаскалу, тоже остался на ночь и думаю, теперь ехать мне в Махачкалу обратно или нет. Друзья собираются пойти гулять, а я ещё думаю: поехать мне ночью или завтра утром, потому что мне ещё нужно на работу.",
+                  "kum": "Тюнегюн Магьачкъалагъа гелдим, гече къалдым. Сонг Къоркъмаскъалагъа бардым, анда да гече къалдым. Энди ойлашаман: Магьачкъалагъа гери барайыммы, бармайыммы? Къурдашларым къыдырмагъа айлана, мен буса дагъы ойлашаман: гече барайыммы яда тангала эртен барайыммы, неге тюгюл магъа дагъы ишге бармагъа герек.",
+                  "domain": "conversation", "source_id": "human_gold"
+              },
+          ]
+
+          SOURCE_WEIGHTS = {
+              "tatoeba": 5.0,
+              "til_ru_kum": 3.0,
+              "dagestan_constitution": 1.5,
+              "bible_caucasus": 0.5,
+          }
+
+          def build_parallel_dataset():
+              files = {
+                  "til_ru_kum": PROC / "parallel_til.jsonl",
+                  "tatoeba": PROC / "parallel_tatoeba.jsonl",
+                  "bible_caucasus": PROC / "parallel_bible.jsonl",
+                  "dagestan_constitution": PROC / "parallel_constitution.jsonl",
+              }
+              rows = []
+              for sid, p in files.items():
+                  if not p.exists():
+                      continue
+                  with p.open(encoding="utf-8") as f:
+                      for line in f:
+                          if not line.strip():
+                              continue
+                          x = json.loads(line)
+                          ru, ku = norm(x.get("ru", "")), norm(x.get("kum", ""))
+                          if not valid_pair(ru, ku):
+                              continue
+                          x["ru"], x["kum"] = ru, ku
+                          x["sample_weight"] = SOURCE_WEIGHTS.get(sid, 1.0)
+                          x["kumyk_evidence"] = round(kumyk_evidence(ku), 2)
+                          rows.append(x)
+
+              # Remove exact pair duplicates while preserving the strongest source weight.
+              dedup = {}
+              for x in rows:
+                  k = (x["ru"].casefold(), x["kum"].casefold())
+                  if k not in dedup or x["sample_weight"] > dedup[k]["sample_weight"]:
+                      dedup[k] = x
+              rows = list(dedup.values())
+
+              # Count source-side conflicts: same Russian with multiple Kumyk translations.
+              ru_to_kum = collections.defaultdict(set)
+              for x in rows:
+                  ru_to_kum[x["ru"].casefold()].add(x["kum"].casefold())
+              for x in rows:
+                  x["translation_conflict_count"] = len(ru_to_kum[x["ru"].casefold()])
+
+              def split(x):
+                  h = int(hashlib.sha256((x["ru"] + "\t" + x["kum"]).encode("utf-8")).hexdigest()[:8], 16) % 100
+                  return "test" if h < 5 else ("dev" if h < 10 else "train")
+
+              buckets = {"train": [], "dev": [], "test": []}
+              for x in rows:
+                  buckets[split(x)].append(x)
+              for name, items in buckets.items():
+                  write_jsonl(FINAL / f"{name}.jsonl", items)
+
+              # Gold is strictly held out.
+              write_jsonl(FINAL / "gold_test.jsonl", HUMAN_GOLD)
+
+              stats = {
+                  "parallel_unique_total": len(rows),
+                  "train": len(buckets["train"]),
+                  "dev": len(buckets["dev"]),
+                  "test": len(buckets["test"]),
+                  "gold_test": len(HUMAN_GOLD),
+                  "by_source": dict(collections.Counter(x["source_id"] for x in rows)),
+                  "same_ru_multiple_kum": sum(1 for v in ru_to_kum.values() if len(v) > 1),
+              }
+              (REPORTS / "dataset_stats.json").write_text(
+                  json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              return stats
+
+          def main():
+              log("=== Kumyk AI dataset build ===")
+              collect_apertium()
+              collect_kaikki()
+              collect_til()
+              collect_tatoeba()
+              collect_madlad()
+              collect_bible()
+              collect_panlex()
+              collect_constitution_optional()
+
+              stats = build_parallel_dataset()
+
+              (REPORTS / "manifest.json").write_text(
+                  json.dumps(MANIFEST, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              (REPORTS / "errors.json").write_text(
+                  json.dumps(ERRORS, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+
+              summary = {
+                  "stats": stats,
+                  "sources": MANIFEST,
+                  "errors": ERRORS,
+              }
+              (REPORTS / "SUMMARY.json").write_text(
+                  json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+
+              readme = f"""Kumyk AI Dataset build
+
+          Unique parallel pairs: {stats['parallel_unique_total']}
+          Train/dev/test: {stats['train']}/{stats['dev']}/{stats['test']}
+          Held-out human gold: {stats['gold_test']}
+
+          See reports/manifest.json, reports/dataset_stats.json and reports/errors.json.
+          """
+              (ROOT / "README.txt").write_text(readme, encoding="utf-8")
+              log(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Collect and build dataset
+        run: python collect_kumyk_dataset.py
+
+      - name: Pack artifact
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          root = Path("kumyk_dataset")
+          out = Path("Kumyk-AI-Dataset-v1.zip")
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+              for p in root.rglob("*"):
+                  if p.is_file():
+                      z.write(p, p.relative_to(root.parent))
+          print(out, out.stat().st_size)
+          PY
+
+      - name: Upload dataset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kumyk-AI-Dataset-v1
+          path: Kumyk-AI-Dataset-v1.zip
+          retention-days: 90
